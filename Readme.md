@@ -6,6 +6,8 @@ Using an [inexpensive rtl-sdr dongle](https://www.amazon.com/s/ref=nb_sb_noss?fi
 
 OpenHAB items, rules, and portion of my sitemap are included
 
+[![rtlamr Power Meter Data in OpenHAB](http://img.youtube.com/vi/d_R2W4a2G6o/0.jpg)](http://www.youtube.com/watch?v=d_R2W4a2G6o "rtlamr Power Meter Data in OpenHAB")
+
 ## Requirements
 
 OpenHAB - Tested version 1.8 on Ubuntu 14.04
