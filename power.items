@@ -1,0 +1,12 @@
+/* Power Data from RTL-AMR */
+Group gPowerMeterData
+Number PowerMeterIntervalNum         "Interval [%s]"                          (gPowerMeterData)
+Number PowerMeterLastInterval        "Last Interval Consumption [%s]"         (gPowerMeterData)
+Number PowerMeterLastIntervalAverage "Last Interval Average Consumption [%s]" (gPowerMeterData)
+Number PowerMeterConsumption         "Consumption [%s]"                       (gPowerMeterData)
+Number Power2DaysAgoUsage            "2 Days Ago [%.2f KWH]"                  (gPowerMeterData)
+Number Power2DaysAgoCost             "2 Days Ago [$%.2f]"                     (gPowerMeterData)
+Number PowerYesterdayUsage           "Yesterday [%.2f KWH]"                   (gPowerMeterData)
+Number PowerYesterdayCost            "Yesterday [$%.2f]"                      (gPowerMeterData)
+Number PowerTodayUsage               "Today [%.2f KWH]"                       (gPowerMeterData)
+Number PowerTodayCost                "Today [$%.2f]"                          (gPowerMeterData)

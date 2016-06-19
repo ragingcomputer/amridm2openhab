@@ -1,0 +1,44 @@
+rule "Update Power Costs"
+when
+    Item  PowerMeterConsumption received update
+then
+    // http://www.oppd.com/residential/residential-rates/
+    // Summer (June 1 – Sept. 30)  - 11.42 cents/kWh for all kWh
+    var Number midnightReading
+    var Number yesterdayMidnightReading
+    var Number days2agoMidnightReading
+    var Number currentReading
+    var Number days2agoUsageKWH
+    var Number yesterdayUsageKWH
+    var Number todayUsageKWH
+    var Number yesterdayCost
+    var Number days2agoCost
+    var Number todayCost
+    var Number KWHCost = 0.1142
+
+    if (PowerMeterConsumption.state instanceof DecimalType) {
+        
+        days2agoMidnightReading = (PowerMeterConsumption.historicState(now.toDateMidnight.minusDays(2), "mysql").state as DecimalType)
+        yesterdayMidnightReading = (PowerMeterConsumption.historicState(now.toDateMidnight.minusDays(1), "mysql").state as DecimalType)
+        midnightReading = (PowerMeterConsumption.historicState(now.toDateMidnight, "mysql").state as DecimalType)
+        currentReading = PowerMeterConsumption.state as DecimalType
+        
+        days2agoUsageKWH = ((yesterdayMidnightReading - days2agoMidnightReading)/100)
+        yesterdayUsageKWH = ((midnightReading - yesterdayMidnightReading)/100)
+        todayUsageKWH = ((currentReading - midnightReading)/100)
+        days2agoCost = days2agoUsageKWH*KWHCost
+        yesterdayCost = yesterdayUsageKWH*KWHCost
+        todayCost = todayUsageKWH*KWHCost
+ 
+        postUpdate(PowerTodayUsage, todayUsageKWH)
+        postUpdate(PowerTodayCost, todayCost)
+               
+        postUpdate(PowerYesterdayUsage, yesterdayUsageKWH)
+        postUpdate(PowerYesterdayCost, yesterdayCost)
+
+        postUpdate(Power2DaysAgoUsage, days2agoUsageKWH)
+        postUpdate(Power2DaysAgoCost, days2agoCost)
+        
+        
+    }
+end

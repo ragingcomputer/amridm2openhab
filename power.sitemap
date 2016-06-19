@@ -1,0 +1,15 @@
+Text label="AMR Power Meter" {
+    Text item=PowerMeterIntervalNum
+    Text item=PowerMeterLastInterval
+    Text item=PowerMeterLastIntervalAverage
+    Text item=PowerMeterConsumption
+    Text item=PowerTodayCost
+    Text item=PowerTodayUsage
+    Text item=PowerYesterdayCost
+    Text item=PowerYesterdayUsage
+    Text item=Power2DaysAgoCost
+    Text item=Power2DaysAgoUsage
+    Chart item=PowerMeterLastInterval period=4h refresh=10000
+    Chart item=PowerMeterLastInterval period=D refresh=10000
+    Chart item=PowerMeterLastInterval period=W refresh=10000
+}

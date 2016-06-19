@@ -1,0 +1,431 @@
+#!/usr/bin/perl -w
+#
+# amridm2openhab
+#
+# Description
+#
+# Using an inexpensive rtl-sdr dongle, it's possible to listen for signals 
+# from ERT compatible smart meters using rtlamr. This script runs as a 
+# daemon, launches rtl_tcp and rtlamr, and parses the output from rtlamr. 
+# If this matches your meter, it will push the data into openhab using the 
+# REST API.
+#
+# Requirements
+#
+# rtl-sdr installed
+# http://sdr.osmocom.org/trac/wiki/rtl-sdr
+#
+# Set dongle serial number with rtl-eeprom
+# http://manpages.ubuntu.com/manpages/trusty/man1/rtl_eeprom.1.html
+#
+# install Go programming language & set gopath
+# sudo apt-get install golang
+# https://golang.org/doc/code.html#GOPATH
+#
+# install rtlamr https://github.com/bemasher/rtlamr
+# go get github.com/bemasher/rtlamr
+#
+# install perl packages
+# sudo apt-get install libwww-mechanize-perl libfile-pid-perl
+#
+# Install
+#
+# create log file and set permissions
+# sudo touch /var/log/amridm2openhab.log
+# sudo chmod 644 /var/log/amridm2openhab.log
+# sudo chown root:adm /var/log/amridm2openhab.log
+#
+# copy perl script into /usr/sbin and set executable
+# sudo cp amridm2openhab /usr/sbin/amridm2openhab
+# sudo chmod +x /usr/sbin/amridm2openhab
+#
+# copy initscript into init.d and set executable
+# sudo cp initscript-amridm2openhab /etc/init.d/amridm2openhab
+# sudo chmod +x /etc/init.d/amridm2openhab
+#
+# set initscript to start and start
+# update-rc.d amridm2openhab defaults 99
+# sudo service amridm2openhab start
+#
+# Optional, watch log file to verify it has started
+# tail -f /var/log/amridm2openhab.log
+
+use strict;
+use warnings;
+use POSIX;
+use File::Pid;
+use WWW::Mechanize;
+use constant DEBUG => 0;
+
+## Configuration
+my $port          = 1234;                       # port for rtl_tcp to listen on
+my $address       = "192.168.1.100";            # bind address for rtl_tcp. 
+                                                # Can be 127.0.0.1 or actual address of your server
+my $dongleSerial  = "00000011";                 # serialnumber set by rtl_eeprom
+my $rtltcp        = "/usr/local/bin/rtl_tcp";   # path to rtl_tcp
+my $rtlamr        = "/opt/gopath/bin/rtlamr";   # path to rtlamr
+my $rtleeprom     = "/usr/local/bin/rtl_eeprom" # path to rtl_eeprom
+my $meterSerial   = "5XXXXXX3";                 # meter serial number, likely on the front of your meter
+                                                # used to filter results to just your meter
+my $openhabServer = "http://username:password\@127.0.0.1:8080"; # URL of OpenHAB server. 
+# Be mindful of the \ escaping the @ sign for basic auth. 
+# If you aren't using auth, just enter the URL similar to http://127.0.0.1:8080
+
+my $logging       = 1;
+my $logFilePath   = "/var/log/";
+my $logFile       = $logFilePath . $daemonName . ".log";
+
+my $pidFilePath   = "/var/run/";
+my $pidFile       = $pidFilePath . $daemonName . ".pid";
+
+my $daemonName    = "amridm2openhab";
+
+print "Starting " . $daemonName . "\n";
+
+my $dieNow        = 0;
+my $isrunning     = 0;
+my $rtlamrpid;
+
+# daemonize
+use POSIX qw(setsid);
+chdir '/';
+umask 0;
+open STDIN,  '/dev/null'   or die "Can't read /dev/null: $!";
+open STDOUT, '>>/dev/null' or die "Can't write to /dev/null: $!";
+open STDERR, '>>/dev/null' or die "Can't write to /dev/null: $!";
+defined( my $pid = fork ) or die "Can't fork: $!";
+exit if $pid;
+
+# dissociate this process from the controlling terminal that started it and stop being part
+# of whatever process group this process was a part of.
+POSIX::setsid() or die "Can't start a new session.";
+
+# callback signal handler for signals.
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = \&signalHandler;
+$SIG{PIPE} = 'ignore';
+
+# create pid file in /var/run/
+my $pidfile = File::Pid->new( { file => $pidFile, } );
+
+$pidfile->write or die "Can't write PID file, /dev/null: $!";
+
+# turn on logging
+if ($logging) {
+	open LOG, ">>$logFile";
+	select((select(LOG), $|=1)[0]); # make the log file "hot" - turn off buffering
+}
+
+if (!$dieNow) {
+
+# check for rtl_tcp running with the parameters we need
+open(PS,"ps -C \"rtl_tcp\" -o pid= -o cmd= |") || die "PS Failed: $!\n";
+while (my $row = <PS>) {
+	if ($row =~ /^\s*([0-9]{1,9})\srtl_tcp -a (.*) -p ([0-9]{1,5}) -d ([0-9]{1,2})/) {
+		if (($3 == $port) && ($2 eq $address)) {
+			logEntry( "RTL_TCP Already Running @ PID " . $1 );
+			$isrunning = 1;
+		}
+	}
+}
+close PS;
+
+# if it wasn't running, get a list of all rtl-sdr dongles by serials and attempt to run rtl_tcp. 
+# Wait 15 seconds for it to load before proceeding
+if ($isrunning == 0) {
+	my @serialList = &getSerials();
+	my $amrDeviceIndex;
+
+	foreach my $device (@serialList){
+		my ($index, $serial) = split /\t/, $device;
+		if ($serial == $dongleSerial) {
+			$amrDeviceIndex = $index;
+		}
+	}
+	logEntry( "Starting RTL_TCP on Device: " . $amrDeviceIndex ) if DEBUG;
+
+	system( $rtltcp . " -a " .$address. " -p " . $port . " -d " . $amrDeviceIndex . " &");
+	sleep(15);
+}
+
+# verify rtl_tcp is running
+if ($isrunning == 0) {
+	open(PS,"ps -C \"rtl_tcp\" -o pid= -o cmd= |") || die "PS Failed: $!\n";
+	while (my $row = <PS>) {
+		if ($row =~ /^\s*([0-9]{1,9})\srtl_tcp -a (.*) -p ([0-9]{1,5}) -d ([0-9]{1,2})/) {
+			if (($3 == $port) && ($2 eq $address)) {
+				logEntry( "RTL_TCP Started @ PID " . $1 );
+				$isrunning = 1;
+			}
+		}
+	}
+	close PS;
+}
+
+# give up if rtl_tcp isn't running
+if ($isrunning == 0) {
+	die "No RTL_TCP: $!\n";
+}
+
+# check if rtlamr is already running for some reason
+# try to die if there's a conflicting instance of this script running
+logEntry( "Starting RTLAMR!" ) if DEBUG;
+open(PS,"ps -C \"rtlamr\" -o pid= -o cmd= |") || die "PS Failed: $!\n";
+while (my $row = <PS>) {
+	if ($row =~ /^\s*([0-9]{1,9})\srtlamr -msgtype=idm -quiet=true -format=csv -server=(.*):([0-9]{1,5})/) {
+		if (($3 == $port) && ($2 eq $address)) {
+			logEntry( "RTLAMR Already Running @ PID " . $1 );
+			die "RTLAMR Already Running: $!\n";
+		}
+	}
+	logEntry( $row ) if DEBUG;
+}
+close PS;
+
+# open rtlamr looking for IDM message type, quiet extra messages, format output as csv, and connect to the rtl_tcp server started earlier
+$rtlamrpid = open(PS, $rtlamr . " -msgtype=idm -quiet=true -format=csv -server=" . $address . ":" . $port . " |") || die "AMR Failed: $!\n";
+if ($rtlamrpid) {
+	logEntry( "RTLAMR Started @ PID " . $rtlamrpid );
+}
+
+# data fields expected as output
+# see http://bemasher.github.io/rtlamr/protocol.html for more info
+
+# Preamble
+# PacketTypeID
+# PacketLength
+# HammingCode
+# ApplicationVersion
+# ERTType
+# ERTSerialNumber
+# ConsumptionIntervalCount
+# ModuleProgrammingState
+# TamperCounters
+# AsynchronousCounters
+# PowerOutageFlags
+# LastConsumptionCount
+# DifferentialConsumptionIntervals
+# TransmitTimeOffset
+# SerialNumberCRC
+# PacketCRC
+
+
+# should be almost infinite loop as long as rtlamr is running
+# split output from rtlamr into fields, compare serialnumber and send to openhab if match
+while (my $row = <PS>) {
+	chomp $row;
+	$row =~ s/\n//;
+	
+	my (
+		$DateTime, 
+		$offset, 
+		$length,
+		$Preamble, 
+		$PacketTypeID, 
+		$PacketLength, 
+		$HammingCode, 
+		$ApplicationVersion, 
+		$ERTType, 
+		$ERTSerialNumber, 
+		$ConsumptionIntervalCount, 
+		$ModuleProgrammingState, 
+		$TamperCounters, 
+		$AsynchronousCounters, 
+		$PowerOutageFlags, 
+		$LastConsumptionCount, 
+		$DifferentialConsumption01, 
+		$DifferentialConsumption02, 
+		$DifferentialConsumption03, 
+		$DifferentialConsumption04, 
+		$DifferentialConsumption05, 
+		$DifferentialConsumption06, 
+		$DifferentialConsumption07, 
+		$DifferentialConsumption08, 
+		$DifferentialConsumption09, 
+		$DifferentialConsumption10, 
+		$DifferentialConsumption11, 
+		$DifferentialConsumption12, 
+		$DifferentialConsumption13, 
+		$DifferentialConsumption14, 
+		$DifferentialConsumption15, 
+		$DifferentialConsumption16, 
+		$DifferentialConsumption17, 
+		$DifferentialConsumption18, 
+		$DifferentialConsumption19, 
+		$DifferentialConsumption20, 
+		$DifferentialConsumption21, 
+		$DifferentialConsumption22, 
+		$DifferentialConsumption23, 
+		$DifferentialConsumption24, 
+		$DifferentialConsumption25, 
+		$DifferentialConsumption26, 
+		$DifferentialConsumption27, 
+		$DifferentialConsumption28, 
+		$DifferentialConsumption29, 
+		$DifferentialConsumption30, 
+		$DifferentialConsumption31, 
+		$DifferentialConsumption32, 
+		$DifferentialConsumption33, 
+		$DifferentialConsumption34, 
+		$DifferentialConsumption35, 
+		$DifferentialConsumption36, 
+		$DifferentialConsumption37, 
+		$DifferentialConsumption38, 
+		$DifferentialConsumption39, 
+		$DifferentialConsumption40, 
+		$DifferentialConsumption41, 
+		$DifferentialConsumption42, 
+		$DifferentialConsumption43, 
+		$DifferentialConsumption44, 
+		$DifferentialConsumption45, 
+		$DifferentialConsumption46, 
+		$DifferentialConsumption47, 
+		$TransmitTimeOffset, 
+		$SerialNumberCRC, 
+		$PacketCRC
+	) = split /,/, $row;
+
+	logEntry( $ERTSerialNumber . "\t" . $LastConsumptionCount ) if DEBUG;
+
+	if ($ERTSerialNumber == $meterSerial) {
+		logEntry( "\nELEC \t" . $row ) if DEBUG;
+		logEntry(
+			"DateTime" . "\t" . $DateTime . "\n" . 
+			"offset" . "\t" . $offset . "\n" .  
+			"length" . "\t" . $length . "\n" . 
+			"Preamble" . "\t" . $Preamble . "\n" . 
+			"PacketTypeID" . "\t" . $PacketTypeID . "\n" . 
+			"PacketLength" . "\t" . $PacketLength . "\n" . 
+			"HammingCode" . "\t" . $HammingCode . "\n" . 
+			"ApplicationVersion" . "\t" . $ApplicationVersion . "\n" . 
+			"ERTType" . "\t" . $ERTType . "\n" . 
+			"ERTSerialNumber" . "\t" . $ERTSerialNumber . "\n" . 
+			"ConsumptionIntervalCount" . "\t" . $ConsumptionIntervalCount . "\n" . 
+			"ModuleProgrammingState" . "\t" . $ModuleProgrammingState . "\n" . 
+			"TamperCounters" . "\t" . $TamperCounters . "\n" . 
+			"AsynchronousCounters" . "\t" . $AsynchronousCounters . "\n" . 
+			"PowerOutageFlags" . "\t" . $PowerOutageFlags . "\n" . 
+			"LastConsumptionCount" . "\t" . $LastConsumptionCount . "\n" . 
+			"TransmitTimeOffset" . "\t" . $TransmitTimeOffset . "\n" . 
+			"SerialNumberCRC" . "\t" . $SerialNumberCRC . "\n" . 
+			"PacketCRC" . "\t" . $PacketCRC ) if DEBUG;
+			
+			&sendToOpenHAB($ConsumptionIntervalCount, $LastConsumptionCount, $DifferentialConsumption01);
+	}
+	
+	# should break out of loop if killing rtlamr doesn't break out
+	if ($dieNow) {
+		last;
+	}
+
+}
+if ($dieNow) {
+	last;
+}
+}
+
+# add a line to the log file
+sub logEntry {
+	my ($logText) = @_;
+	my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime(time);
+	my $dateTime = sprintf "%4d-%02d-%02d %02d:%02d:%02d", $year + 1900, $mon + 1, $mday, $hour, $min, $sec;
+	if ($logging) {
+		print LOG "$dateTime $logText\n";
+	}
+}
+
+# handles sigterm sighup and sigkill
+# kills rtlamr process which should end the main loop
+sub signalHandler {
+	$dieNow = 1;
+	logEntry( "set dieNow" ) if DEBUG;
+	logEntry( "Ending rtlamr @ PID " . $rtlamrpid );
+	kill("TERM", $rtlamrpid);
+}
+
+# return a list of devices by serial number
+sub getSerials() {
+	open(PS, $rtleeprom . " 2>&1 |") || die "EEPROM Failed: $!\n";
+	my $numDevices = 0;
+	my @deviceNumber;
+	my $CurrentlyListingDevices = 0;
+	my $deviceIndex;
+	my $deviceSerial;
+	my @deviceList;
+	while (my $row = <PS>) {
+		chomp $row;
+		if ($row =~ /^Found ([0-9]{1,2}) device\(s\)\:/) {
+			logEntry( "Devices:\t" . $1 ) if DEBUG;
+			$numDevices = $1;
+			$CurrentlyListingDevices = 1;
+		}
+		if ($CurrentlyListingDevices) {
+			if ($row =~ /^\s+([0-9]{1,2})\:\s+(.*)$/) {
+				logEntry( "Add Index:\t" . $1 ) if DEBUG;
+				push(@deviceNumber, $1)
+			}
+		}
+		if ($row =~ /^Using device/) {
+			$CurrentlyListingDevices = 0;
+		}
+	}
+	close PS;
+	foreach my $device (@deviceNumber){
+		open(PS, $rtleeprom . " -d " . $device . " 2>&1 |") || die "EEPROM 2 Failed: $!\n";
+		while (my $row = <PS>) {
+			chomp $row;
+			if ($row =~ /^Using device ([0-9]{1,2})\:/) {
+				logEntry( $1 ) if DEBUG;
+				$deviceIndex = $1;
+			}
+			if ($row =~ /^Serial number\:\s+([0-9]{1,})/) {
+				logEntry( $1 ) if DEBUG;
+				$deviceSerial = $1;
+			}		
+		}
+		push(@deviceList, $deviceIndex . "\t" . $deviceSerial);
+		close PS;
+	}
+	return @deviceList;
+}
+
+# sends data to OpenHAB's REST API using WWW:Mechanize library
+# failure to send is noted in log, but doesn't kill script.
+# this behavior is helpful for restarting OpenHAB without
+# requiring restart of amridm2openhab service as well
+sub sendToOpenHAB() {
+	my $ConsumptionIntervalCount = shift;
+	my $LastConsumptionCount = shift;
+	my $DifferentialConsumption01 = shift;
+	my $intervalAverage = ($DifferentialConsumption01 * 10) / (1 / 12);
+	my $res;
+	my $uri;
+	
+	my $mech = WWW::Mechanize->new( autocheck => 0 );
+	
+	logEntry( "Sending Values" . $ConsumptionIntervalCount . "\t" . $LastConsumptionCount . "\t" . $DifferentialConsumption01 . "\t" . $intervalAverage);
+
+	$uri = $openhabServer . '/rest/items/PowerMeterIntervalNum/state';
+	$res = $mech->put( $uri, content => $ConsumptionIntervalCount );
+	$res->is_success or logEntry("Send Failed");
+
+	$uri = $openhabServer . '/rest/items/PowerMeterLastInterval/state';
+	$res = $mech->put( $uri, content => $DifferentialConsumption01 );
+	$res->is_success or logEntry("Send Failed");
+
+	$uri = $openhabServer . '/rest/items/PowerMeterConsumption/state';
+	$res = $mech->put( $uri, content => $LastConsumptionCount );
+	$res->is_success or logEntry("Send Failed");
+
+	$uri = $openhabServer . '/rest/items/PowerMeterLastIntervalAverage/state';
+	$res = $mech->put( $uri, content => $intervalAverage );	
+	$res->is_success or logEntry("Send Failed");
+
+}
+
+# Cleanup on exit, close file handles and remove pidfile
+END {
+	logEntry( "Exit" );
+	close PS;
+	if ($logging) { close LOG }
+	$pidfile->remove if defined $pidfile;
+}
